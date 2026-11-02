@@ -52,7 +52,12 @@ state = {
     "active_position": None, "active_position_details": [], "api_configured": False,
     "api_status_msg": "", "last_execution_error": None, "latest_scans": {},
     "trade_history": [], "selected_pairs": [], "validation_score": None,
-    "learning_stats": {}, "auto_trade_enabled": False
+    "learning_stats": {}, "training_stats": {}, "auto_trade_enabled": False,
+    "validation_passed": False, "validation_min_score": 0.36,
+    "training_rows": 0, "validation_rows": 0, "model_pairs": [],
+    "last_training_attempt_time": None, "last_scan_attempt_time": None,
+    "last_scan_status": "NOT_STARTED", "active_universe": [],
+    "last_training_failure": None, "last_risk_block": None
 }
 
 
@@ -91,6 +96,18 @@ class Store:
         with self.connect() as c:
             c.execute("CREATE TABLE IF NOT EXISTS predictions (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, candle_ts INTEGER NOT NULL, created_ts INTEGER NOT NULL, side TEXT NOT NULL, entry REAL NOT NULL, confidence REAL NOT NULL, outcome TEXT, exit_price REAL, resolved_ts INTEGER, UNIQUE(symbol,candle_ts))")
             c.execute("CREATE TABLE IF NOT EXISTS trade_events (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, side TEXT, created_ts INTEGER, confidence REAL, order_id TEXT)")
+            c.execute("""CREATE TABLE IF NOT EXISTS training_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, created_ts INTEGER NOT NULL,
+                validation_score REAL, passed INTEGER NOT NULL, reason TEXT NOT NULL,
+                training_rows INTEGER NOT NULL DEFAULT 0, validation_rows INTEGER NOT NULL DEFAULT 0,
+                pairs TEXT NOT NULL DEFAULT ''
+            )""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_training_runs_created ON training_runs(created_ts)")
+            c.execute("""CREATE TABLE IF NOT EXISTS order_intents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, candle_ts INTEGER NOT NULL,
+                created_ts INTEGER NOT NULL, side TEXT NOT NULL, status TEXT NOT NULL,
+                order_id TEXT, UNIQUE(symbol,candle_ts,side)
+            )""")
             c.commit()
 
     def add_prediction(self, symbol, candle_ts, side, price, confidence):
@@ -143,6 +160,55 @@ class Store:
             "executed_trades_24h": trades,
             "by_symbol": [{"symbol": r["symbol"], "resolved": r["resolved"], "wins": r["wins"], "win_rate_pct": round(100*r["wins"]/r["resolved"],1) if r["resolved"] else None} for r in by_symbol]
         }
+
+    def add_training_run(self, score, passed, reason, training_rows=0, validation_rows=0, pairs=None):
+        with self.lock, self.connect() as c:
+            c.execute(
+                "INSERT INTO training_runs(created_ts,validation_score,passed,reason,training_rows,validation_rows,pairs) VALUES(?,?,?,?,?,?,?)",
+                (int(time.time()), None if score is None else float(score), 1 if passed else 0,
+                 str(reason)[:300], int(training_rows or 0), int(validation_rows or 0),
+                 ",".join(pairs or []))
+            )
+            c.commit()
+
+    def training_stats(self):
+        with self.connect() as c:
+            total = c.execute("SELECT COUNT(*) n FROM training_runs").fetchone()["n"]
+            passed = c.execute("SELECT COUNT(*) n FROM training_runs WHERE passed=1").fetchone()["n"]
+            last = c.execute("SELECT created_ts,validation_score,passed,reason,training_rows,validation_rows,pairs FROM training_runs ORDER BY id DESC LIMIT 1").fetchone()
+            recent = c.execute("SELECT created_ts,validation_score,passed,reason,training_rows,validation_rows,pairs FROM training_runs ORDER BY id DESC LIMIT 20").fetchall()
+        def pack(r):
+            return {
+                "time": datetime.fromtimestamp(int(r["created_ts"])).strftime("%Y-%m-%d %H:%M:%S"),
+                "validation_score": r["validation_score"], "passed": bool(r["passed"]),
+                "reason": r["reason"], "training_rows": int(r["training_rows"]),
+                "validation_rows": int(r["validation_rows"]),
+                "pairs": [x for x in str(r["pairs"] or "").split(",") if x]
+            }
+        return {
+            "attempts": int(total), "passed_attempts": int(passed),
+            "failed_attempts": int(total-passed),
+            "last_attempt": pack(last) if last else None,
+            "recent": [pack(r) for r in recent]
+        }
+
+    def reserve_order_intent(self, symbol, candle_ts, side):
+        # Persist intent before sending; ambiguous timeouts must not trigger an automatic duplicate.
+        with self.lock, self.connect() as c:
+            cur = c.execute(
+                "INSERT OR IGNORE INTO order_intents(symbol,candle_ts,created_ts,side,status) VALUES(?,?,?,?,?)",
+                (symbol, int(candle_ts), int(time.time()), side, "PENDING")
+            )
+            c.commit()
+            return cur.rowcount == 1
+
+    def finish_order_intent(self, symbol, candle_ts, side, status, order_id=None):
+        with self.lock, self.connect() as c:
+            c.execute(
+                "UPDATE order_intents SET status=?,order_id=? WHERE symbol=? AND candle_ts=? AND side=?",
+                (status, str(order_id or ""), symbol, int(candle_ts), side)
+            )
+            c.commit()
 
     def trade_count_today(self):
         start = int(datetime.combine(date.today(), datetime.min.time()).timestamp())
@@ -229,18 +295,34 @@ class CoinDCX:
 
     def positions(self):
         found = {}
-        for margin in (["INR"], ["USDT"]):
-            for page in (1, 2):
-                body = {"timestamp": int(time.time()*1000), "page": page, "size": 100, "margin_currency_short_name": margin}
-                try:
-                    data = self.signed("POST", "/exchange/v1/derivatives/futures/positions", body=body)
-                    if isinstance(data, list):
-                        for p in data:
-                            qty = float(p.get("active_pos", 0) or 0)
-                            if abs(qty) > 1e-8:
-                                found[str(p.get("id"))] = p
-                except Exception as exc:
-                    log.warning("Positions query (%s) failed: %s", margin, exc)
+        # INR is the bot's configured margin currency. If either INR page cannot be
+        # checked, fail closed so the main loop cannot assume the account is flat.
+        for page in (1, 2):
+            body = {"timestamp": int(time.time()*1000), "page": page, "size": 100, "margin_currency_short_name": ["INR"]}
+            try:
+                data = self.signed("POST", "/exchange/v1/derivatives/futures/positions", body=body)
+                if not isinstance(data, list):
+                    raise RuntimeError(f"Unexpected INR positions response type: {type(data).__name__}")
+                for p in data:
+                    qty = float(p.get("active_pos", 0) or 0)
+                    if abs(qty) > 1e-8:
+                        found[str(p.get("id"))] = p
+            except Exception as exc:
+                log.error("Required INR positions query page %s failed; blocking new entries: %s", page, exc)
+                raise RuntimeError(f"Cannot verify INR futures positions (page {page}); new entries blocked: {exc}") from exc
+        # USDT positions are informational for this INR-margin bot. Log failures,
+        # but don't let an unsupported/disabled USDT endpoint suppress INR checks.
+        for page in (1, 2):
+            body = {"timestamp": int(time.time()*1000), "page": page, "size": 100, "margin_currency_short_name": ["USDT"]}
+            try:
+                data = self.signed("POST", "/exchange/v1/derivatives/futures/positions", body=body)
+                if isinstance(data, list):
+                    for p in data:
+                        qty = float(p.get("active_pos", 0) or 0)
+                        if abs(qty) > 1e-8:
+                            found[str(p.get("id"))] = p
+            except Exception as exc:
+                log.warning("Optional USDT positions query page %s failed: %s", page, exc)
         return list(found.values())
 
     def set_tpsl(self, pos_id, tp, sl):
@@ -267,9 +349,12 @@ class CoinDCX:
         data = self.signed("POST", "/exchange/v1/derivatives/futures/positions/exit", body={"timestamp": int(time.time()*1000), "id": pos_id})
         return data
 
-    def place_order(self, pair, side, qty, leverage):
+    def place_order(self, pair, side, qty, leverage, take_profit=None, stop_loss=None):
         order = {"pair": pair, "side": side.lower(), "order_type": "market_order", "total_quantity": qty,
-                 "leverage": int(leverage), "margin_currency_short_name": "INR"}
+                 "leverage": int(leverage), "margin_currency_short_name": ["INR"]}
+        if take_profit is not None and stop_loss is not None:
+            order["take_profit_price"] = float(take_profit)
+            order["stop_loss_price"] = float(stop_loss)
         body = {"timestamp": int(time.time()*1000), "order": order}
         return self.signed("POST", "/exchange/v1/derivatives/futures/orders/create", body=body)
 
@@ -281,6 +366,7 @@ class MLEngine:
         self.is_trained = False
         self.validation_score = None
         self.last_train = 0
+        self.last_train_attempt = 0
         self.last_universe_refresh = 0
         self.selected_assets = []
         self.pairs = []
@@ -395,11 +481,31 @@ class MLEngine:
         return f, x, yy
 
     def train(self, cfg, force=False):
-        if self.is_trained and not force and time.time()-self.last_train < 1800:
+        now = time.time()
+        # Throttle failed attempts to avoid hammering public candle endpoints.
+        if not force and self.last_train_attempt and now-self.last_train_attempt < 600:
             return
+        if self.is_trained and not force and now-self.last_train < 1800:
+            return
+        self.last_train_attempt = now
+        state["last_training_attempt_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        min_score = float(cfg.get("min_validation_score", 0.36))
+        state["validation_min_score"] = min_score
+        state["validation_passed"] = False
+        state["model_pairs"] = []
+        state["training_rows"] = 0
+        state["validation_rows"] = 0
         pairs = self.refresh_universe()
+        state["active_universe"] = list(pairs)
+        state["selected_pairs"] = list(pairs)
         if not pairs:
             self.is_trained = False
+            self.validation_score = None
+            state["validation_score"] = None
+            state["last_training_failure"] = "No active allowlisted Futures pairs"
+            store.add_training_run(None, False, state["last_training_failure"], pairs=[])
+            state["training_stats"] = store.training_stats()
+            log.warning("ML training skipped: no active allowlisted Futures pairs")
             return
         datasets = []
         for pair in pairs:
@@ -412,6 +518,11 @@ class MLEngine:
             datasets.append((pair, f, x, y, turnover))
         if not datasets:
             self.is_trained = False
+            self.validation_score = None
+            state["validation_score"] = None
+            state["last_training_failure"] = "No usable active Futures candle data"
+            store.add_training_run(None, False, state["last_training_failure"], pairs=pairs)
+            state["training_stats"] = store.training_stats()
             log.warning("ML training skipped: no usable active futures candle data")
             return
         datasets.sort(key=lambda z: z[4], reverse=True)
@@ -429,12 +540,24 @@ class MLEngine:
             val_y.append(y.iloc[cut:])
         if not train_x or not val_x:
             self.is_trained = False
+            self.validation_score = None
+            state["validation_score"] = None
+            state["last_training_failure"] = "Insufficient train/validation samples"
+            store.add_training_run(None, False, state["last_training_failure"], pairs=[p for p, *_ in selected])
+            state["training_stats"] = store.training_stats()
             log.warning("Walk-forward training skipped: insufficient data")
             return
         Xtr, Ytr = pd.concat(train_x), pd.concat(train_y)
         Xv, Yv = pd.concat(val_x), pd.concat(val_y)
+        state["training_rows"] = int(len(Xtr))
+        state["validation_rows"] = int(len(Xv))
         if Ytr.nunique() < 3 or Yv.nunique() < 2:
             self.is_trained = False
+            self.validation_score = None
+            state["validation_score"] = None
+            state["last_training_failure"] = "Missing label classes in train or validation split"
+            store.add_training_run(None, False, state["last_training_failure"], len(Xtr), len(Xv), [p for p, *_ in selected])
+            state["training_stats"] = store.training_stats()
             log.warning("Walk-forward training skipped: missing label classes")
             return
         probe = HistGradientBoostingClassifier(max_iter=120, learning_rate=0.05, max_leaf_nodes=15, l2_regularization=1.5, random_state=42)
@@ -442,10 +565,15 @@ class MLEngine:
             probe.fit(Xtr, Ytr)
             score = float(balanced_accuracy_score(Yv, probe.predict(Xv)))
             self.validation_score = score
-            min_score = float(cfg.get("min_validation_score", 0.36))
-            if not np.isfinite(score) or score < min_score:
+            state["validation_score"] = round(score, 4)
+            state["validation_min_score"] = min_score
+            state["validation_passed"] = bool(np.isfinite(score) and score >= min_score)
+            state["last_training_failure"] = None if state["validation_passed"] else "Validation score below configured minimum"
+            if not state["validation_passed"]:
                 self.is_trained = False
                 self.selected_assets = []
+                store.add_training_run(score, False, state["last_training_failure"], len(Xtr), len(Xv), [p for p, *_ in selected])
+                state["training_stats"] = store.training_stats()
                 log.warning("Walk-forward score %.3f below %.3f; live entries disabled", score, min_score)
                 return
             # After measuring holdout score, train production model on all available labeled rows.
@@ -458,8 +586,17 @@ class MLEngine:
             log.info("ML retrained on %d rows; walk-forward balanced accuracy %.3f; scan pairs=%s", len(all_x), score, self.selected_assets)
             state["last_train_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             state["validation_score"] = round(score, 4)
+            state["validation_passed"] = True
+            state["last_training_failure"] = None
+            state["model_pairs"] = list(self.selected_assets)
+            store.add_training_run(score, True, "Validation passed and production model trained", len(all_x), len(Xv), self.selected_assets)
+            state["training_stats"] = store.training_stats()
         except Exception as exc:
             self.is_trained = False
+            state["validation_passed"] = False
+            state["last_training_failure"] = str(exc)[:300]
+            store.add_training_run(self.validation_score, False, state["last_training_failure"], state.get("training_rows", 0), state.get("validation_rows", 0), [p for p, *_ in selected] if "selected" in locals() else pairs)
+            state["training_stats"] = store.training_stats()
             log.exception("ML training failed: %s", exc)
 
     @staticmethod
@@ -484,6 +621,10 @@ class MLEngine:
         row = f.iloc[-1]
         price, atr = float(row.close), float(row.atr)
         candle_ts = int(row.timestamp)
+        candle_age = max(0, int(time.time()) - candle_ts)
+        if candle_age > int(cfg.get("max_candle_age_seconds", 900)):
+            return {"symbol": symbol, "action": "HOLD", "price": price, "confidence": 0,
+                    "reason": f"Stale 5m candle ({candle_age}s old); entries blocked", "candle_ts": candle_ts}
         if not self.is_trained:
             return {"symbol": symbol, "action": "HOLD", "price": price, "confidence": 0, "reason": "ML unavailable/validation failed"}
         x = pd.DataFrame([{k: float(row[k]) for k in FEATURES}])
@@ -537,6 +678,7 @@ class Dashboard(BaseHTTPRequestHandler):
         if self.path.startswith("/api/status"):
             payload = dict(state)
             payload["learning_stats"] = store.stats()
+            payload["training_stats"] = store.training_stats()
             raw = json.dumps(payload, default=str).encode()
             self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers(); self.wfile.write(raw)
             return
@@ -608,7 +750,10 @@ def main():
             cfg = load_config()
             client.update(cfg)
             state["auto_trade_enabled"] = bool(cfg.get("auto_trade_enabled", False))
-            state["selected_pairs"] = ml.pairs
+            state["selected_pairs"] = list(ml.pairs)
+            state["active_universe"] = list(ml.pairs)
+            state["last_scan_attempt_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            state["last_scan_status"] = "STARTED"
             fx = float(cfg.get("inr_per_usdt", 91.5))
             if not client.key or not client.secret:
                 state["status"] = "API_CREDENTIALS_MISSING"
@@ -632,17 +777,21 @@ def main():
             ml.train(cfg)
             if ml.is_trained:
                 symbols = list(ml.selected_assets)
-                state["selected_pairs"] = symbols
+                state["selected_pairs"] = list(ml.pairs)
+                state["model_pairs"] = symbols
                 scans = {}
                 for sym in symbols:
                     scans[sym] = ml.analyze(sym, cfg)
                 state["latest_scans"] = scans
                 state["last_scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                state["last_scan_status"] = "COMPLETED"
                 store.resolve_due(ml.price_cache)
             else:
                 scans = {}
                 state["latest_scans"] = scans
-                state["selected_pairs"] = []
+                state["selected_pairs"] = list(ml.pairs)
+                state["model_pairs"] = []
+                state["last_scan_status"] = "BLOCKED_ML_NOT_VALIDATED"
 
             positions = client.positions()
             details = manage_positions(client, ml, positions, cfg)
@@ -667,7 +816,18 @@ def main():
                         symbol = sym
                         pair = "B-" + symbol.replace("USDT", "") + "_USDT"
                         px = float(sig.get("price", 0) or 0)
-                        if px <= 0:
+                        candle_ts = int(sig.get("candle_ts", 0) or 0)
+                        if px <= 0 or not candle_ts or time.time() - candle_ts > int(cfg.get("max_signal_age_seconds", 600)):
+                            state["last_risk_block"] = f"Stale or invalid signal blocked: {symbol}"
+                            log.warning(state["last_risk_block"])
+                            continue
+                        if sig.get("tp") is None or sig.get("sl") is None:
+                            state["last_risk_block"] = f"Signal missing TP/SL; entry blocked: {symbol}"
+                            log.error(state["last_risk_block"])
+                            continue
+                        if not store.reserve_order_intent(symbol, candle_ts, sig["action"]):
+                            state["last_risk_block"] = f"Duplicate candle order intent blocked: {symbol}"
+                            log.warning(state["last_risk_block"])
                             continue
                         free = float(wallet.get("free", 0))
                         min_free = float(cfg.get("min_free_balance_inr", 500))
@@ -693,11 +853,28 @@ def main():
                         action = sig["action"]
                         try:
                             log.warning("LIVE ORDER attempt: %s %s qty=%s leverage=%sx margin~₹%.0f confidence=%s", pair, action, qty, lev, margin, sig.get("confidence"))
-                            result = client.place_order(pair, action, qty, lev)
-                            # Check explicit API rejection where response includes status/success.
-                            if isinstance(result, dict) and (result.get("success") is False or str(result.get("status", "")).lower() in ("rejected", "failed")):
-                                raise RuntimeError(f"Order rejected: {result}")
-                            order_id = result.get("id") if isinstance(result, dict) else ""
+                            result = client.place_order(pair, action, qty, lev, take_profit=sig.get("tp"), stop_loss=sig.get("sl"))
+                            # CoinDCX Futures Create Order returns a list of order objects.
+                            order_record = None
+                            if isinstance(result, list):
+                                order_record = next((item for item in result if isinstance(item, dict)), None)
+                            elif isinstance(result, dict):
+                                order_record = result
+                                nested = result.get("data")
+                                if isinstance(nested, list):
+                                    order_record = next((item for item in nested if isinstance(item, dict)), result)
+                                elif isinstance(nested, dict) and not (result.get("id") or result.get("order_id")):
+                                    order_record = nested
+                            if isinstance(order_record, dict) and str(order_record.get("status", "")).lower() in ("rejected", "failed", "cancelled"):
+                                raise RuntimeError(f"Order rejected: {str(order_record)[:500]}")
+                            order_id = ""
+                            if isinstance(order_record, dict):
+                                order_id = order_record.get("id") or order_record.get("order_id") or ""
+                            explicit_success = isinstance(result, dict) and result.get("success") is True
+                            if not order_id and not explicit_success:
+                                store.finish_order_intent(symbol, candle_ts, action, "AMBIGUOUS")
+                                raise RuntimeError(f"Order response did not confirm acceptance; manual exchange check required: {str(result)[:300]}")
+                            store.finish_order_intent(symbol, candle_ts, action, "ACKNOWLEDGED", order_id)
                             store.add_trade(symbol, action, float(sig.get("confidence",0)), order_id)
                             state["last_execution_error"] = None
                             state["trade_history"].insert(0, {"symbol": symbol, "side": action, "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "confidence": sig.get("confidence"), "order_id": order_id})
@@ -711,14 +888,32 @@ def main():
                                 # Use signal-derived stop levels; API response must explicitly confirm TP and SL.
                                 attached = client.set_tpsl(mp.get("id"), round(float(sig["tp"]), 8), round(float(sig["sl"]), 8))
                                 if not attached:
-                                    state["last_execution_error"] = "ENTRY SENT BUT TP/SL NOT CONFIRMED — check CoinDCX immediately"
+                                    state["last_execution_error"] = "ENTRY SENT BUT TP/SL NOT CONFIRMED — emergency exit requested"
                                     log.critical(state["last_execution_error"])
+                                    try:
+                                        exit_result = client.exit_position(mp.get("id"))
+                                        log.critical("Emergency exit response after TP/SL failure: %s", str(exit_result)[:500])
+                                        time.sleep(2)
+                                        still_open = [p for p in client.positions() if p.get("pair") == pair and abs(float(p.get("active_pos",0) or 0)) > 0]
+                                        if still_open:
+                                            state["last_execution_error"] = "CRITICAL: TP/SL unconfirmed and emergency exit not verified. Check CoinDCX immediately."
+                                            log.critical(state["last_execution_error"])
+                                        else:
+                                            state["last_execution_error"] = "TP/SL unconfirmed; emergency exit request sent and position no longer reported open. Verify exchange history."
+                                    except Exception as exit_exc:
+                                        state["last_execution_error"] = f"CRITICAL: TP/SL unconfirmed and emergency exit failed: {exit_exc}. Check CoinDCX immediately."
+                                        log.critical(state["last_execution_error"])
                             else:
-                                state["last_execution_error"] = "Order accepted but open position not confirmed; check CoinDCX immediately"
+                                state["last_execution_error"] = "Order response acknowledged but open position not confirmed; automatic retry blocked. Check CoinDCX immediately."
                                 log.critical(state["last_execution_error"])
+                                store.finish_order_intent(symbol, candle_ts, action, "ACKNOWLEDGED_POSITION_UNCONFIRMED", order_id)
                             break
                         except Exception as exc:
                             state["last_execution_error"] = str(exc)
+                            try:
+                                store.finish_order_intent(symbol, candle_ts, action, "ERROR_OR_AMBIGUOUS")
+                            except Exception:
+                                pass
                             log.error("Order execution failed: %s", exc)
                             break
                 elif auto and daily_count >= max_day:
@@ -748,6 +943,7 @@ rm -f "$TMP"
 
 echo ""
 echo "SUCCESS: New bot candidate installed at: $DEST"
+echo "Existing learning database ($APP_DIR/learning.db) is preserved; telemetry tables are created additively."
 echo "Existing bot.py and its running process were NOT replaced or restarted."
 echo "This is intentional to avoid interrupting an open Futures position."
 if pgrep -af '[p]ython.*coindcx-bot/bot.py' >/dev/null 2>&1; then
