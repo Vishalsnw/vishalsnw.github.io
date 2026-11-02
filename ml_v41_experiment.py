@@ -179,7 +179,7 @@ def fold_masks(panel, train_end, test_start, test_end):
     end_cut = times[i_end - 1]
     embargo = 3 * 5 * 60
     train = panel.timestamp < (train_cut - embargo)
-    test = (panel.timestamp >= (test_cut + embargo)) & (panel.timestamp <= end_cut)
+    test = (panel.timestamp >= (test_cut + embargo)) & (panel.timestamp <= (end_cut - embargo))
     return train, test, (train_cut, test_cut, end_cut)
 
 
