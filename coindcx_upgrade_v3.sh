@@ -295,18 +295,34 @@ class CoinDCX:
 
     def positions(self):
         found = {}
-        for margin in (["INR"], ["USDT"]):
-            for page in (1, 2):
-                body = {"timestamp": int(time.time()*1000), "page": page, "size": 100, "margin_currency_short_name": margin}
-                try:
-                    data = self.signed("POST", "/exchange/v1/derivatives/futures/positions", body=body)
-                    if isinstance(data, list):
-                        for p in data:
-                            qty = float(p.get("active_pos", 0) or 0)
-                            if abs(qty) > 1e-8:
-                                found[str(p.get("id"))] = p
-                except Exception as exc:
-                    log.warning("Positions query (%s) failed: %s", margin, exc)
+        # INR is the bot's configured margin currency. If either INR page cannot be
+        # checked, fail closed so the main loop cannot assume the account is flat.
+        for page in (1, 2):
+            body = {"timestamp": int(time.time()*1000), "page": page, "size": 100, "margin_currency_short_name": ["INR"]}
+            try:
+                data = self.signed("POST", "/exchange/v1/derivatives/futures/positions", body=body)
+                if not isinstance(data, list):
+                    raise RuntimeError(f"Unexpected INR positions response type: {type(data).__name__}")
+                for p in data:
+                    qty = float(p.get("active_pos", 0) or 0)
+                    if abs(qty) > 1e-8:
+                        found[str(p.get("id"))] = p
+            except Exception as exc:
+                log.error("Required INR positions query page %s failed; blocking new entries: %s", page, exc)
+                raise RuntimeError(f"Cannot verify INR futures positions (page {page}); new entries blocked: {exc}") from exc
+        # USDT positions are informational for this INR-margin bot. Log failures,
+        # but don't let an unsupported/disabled USDT endpoint suppress INR checks.
+        for page in (1, 2):
+            body = {"timestamp": int(time.time()*1000), "page": page, "size": 100, "margin_currency_short_name": ["USDT"]}
+            try:
+                data = self.signed("POST", "/exchange/v1/derivatives/futures/positions", body=body)
+                if isinstance(data, list):
+                    for p in data:
+                        qty = float(p.get("active_pos", 0) or 0)
+                        if abs(qty) > 1e-8:
+                            found[str(p.get("id"))] = p
+            except Exception as exc:
+                log.warning("Optional USDT positions query page %s failed: %s", page, exc)
         return list(found.values())
 
     def set_tpsl(self, pos_id, tp, sl):
@@ -473,6 +489,7 @@ class MLEngine:
         min_score = float(cfg.get("min_validation_score", 0.36))
         state["validation_min_score"] = min_score
         state["validation_passed"] = False
+        state["model_pairs"] = []
         state["training_rows"] = 0
         state["validation_rows"] = 0
         pairs = self.refresh_universe()
