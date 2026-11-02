@@ -349,9 +349,12 @@ class CoinDCX:
         data = self.signed("POST", "/exchange/v1/derivatives/futures/positions/exit", body={"timestamp": int(time.time()*1000), "id": pos_id})
         return data
 
-    def place_order(self, pair, side, qty, leverage):
+    def place_order(self, pair, side, qty, leverage, take_profit=None, stop_loss=None):
         order = {"pair": pair, "side": side.lower(), "order_type": "market_order", "total_quantity": qty,
-                 "leverage": int(leverage), "margin_currency_short_name": "INR"}
+                 "leverage": int(leverage), "margin_currency_short_name": ["INR"]}
+        if take_profit is not None and stop_loss is not None:
+            order["take_profit_price"] = float(take_profit)
+            order["stop_loss_price"] = float(stop_loss)
         body = {"timestamp": int(time.time()*1000), "order": order}
         return self.signed("POST", "/exchange/v1/derivatives/futures/orders/create", body=body)
 
@@ -850,17 +853,25 @@ def main():
                         action = sig["action"]
                         try:
                             log.warning("LIVE ORDER attempt: %s %s qty=%s leverage=%sx margin~₹%.0f confidence=%s", pair, action, qty, lev, margin, sig.get("confidence"))
-                            result = client.place_order(pair, action, qty, lev)
-                            # Check explicit API rejection where response includes status/success.
-                            if isinstance(result, dict) and (result.get("success") is False or str(result.get("status", "")).lower() in ("rejected", "failed")):
-                                raise RuntimeError(f"Order rejected: {result}")
-                            order_id = ""
-                            if isinstance(result, dict):
-                                order_id = result.get("id") or result.get("order_id") or ""
+                            result = client.place_order(pair, action, qty, lev, take_profit=sig.get("tp"), stop_loss=sig.get("sl"))
+                            # CoinDCX Futures Create Order returns a list of order objects.
+                            order_record = None
+                            if isinstance(result, list):
+                                order_record = next((item for item in result if isinstance(item, dict)), None)
+                            elif isinstance(result, dict):
+                                order_record = result
                                 nested = result.get("data")
-                                if not order_id and isinstance(nested, dict):
-                                    order_id = nested.get("id") or nested.get("order_id") or ""
-                            if not order_id and not (isinstance(result, dict) and result.get("success") is True):
+                                if isinstance(nested, list):
+                                    order_record = next((item for item in nested if isinstance(item, dict)), result)
+                                elif isinstance(nested, dict) and not (result.get("id") or result.get("order_id")):
+                                    order_record = nested
+                            if isinstance(order_record, dict) and str(order_record.get("status", "")).lower() in ("rejected", "failed", "cancelled"):
+                                raise RuntimeError(f"Order rejected: {str(order_record)[:500]}")
+                            order_id = ""
+                            if isinstance(order_record, dict):
+                                order_id = order_record.get("id") or order_record.get("order_id") or ""
+                            explicit_success = isinstance(result, dict) and result.get("success") is True
+                            if not order_id and not explicit_success:
                                 store.finish_order_intent(symbol, candle_ts, action, "AMBIGUOUS")
                                 raise RuntimeError(f"Order response did not confirm acceptance; manual exchange check required: {str(result)[:300]}")
                             store.finish_order_intent(symbol, candle_ts, action, "ACKNOWLEDGED", order_id)
