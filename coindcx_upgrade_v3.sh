@@ -362,7 +362,7 @@ class CoinDCX:
 class MLEngine:
     def __init__(self, client):
         self.client = client
-        self.model = HistGradientBoostingClassifier(max_iter=150, learning_rate=0.05, max_leaf_nodes=15, l2_regularization=1.5, random_state=42)
+        self.model = HistGradientBoostingClassifier(max_iter=220, learning_rate=0.035, max_leaf_nodes=15, l2_regularization=2.0, min_samples_leaf=25, random_state=42)
         self.is_trained = False
         self.validation_score = None
         self.last_train = 0
@@ -396,7 +396,7 @@ class MLEngine:
         self.last_universe_refresh = time.time()
         return self.pairs
 
-    def fetch(self, pair, resolution="5", limit=700):
+    def fetch(self, pair, resolution="5", limit=5000):
         now = int(time.time())
         mins = int(resolution) if str(resolution).isdigit() else 5
         frm = now - (limit * mins * 60 + 3600)
@@ -466,12 +466,14 @@ class MLEngine:
         return d.replace([np.inf,-np.inf], np.nan).dropna().reset_index(drop=True)
 
     def _label(self, pair):
-        raw = self.fetch(pair, "5", 700)
+        raw = self.fetch(pair, "5", 5000)
         f = self.features(raw)
-        if len(f) < 180:
+        if len(f) < 500:
+            log.warning("Training data insufficient for %s: %d feature rows (need 500)", pair, len(f))
             return None
-        future = f.close.shift(-3)/f.close-1
-        band = (f.atr_pct*0.85).clip(lower=0.0018, upper=0.012)
+        # Six completed 5m bars (~30m) reduces sensitivity to one-candle noise.
+        future = f.close.shift(-6)/f.close-1
+        band = (f.atr_pct*1.00).clip(lower=0.0020, upper=0.0150)
         y = pd.Series(1, index=f.index, dtype=int)
         y[future > band] = 2
         y[future < -band] = 0
@@ -531,11 +533,11 @@ class MLEngine:
         train_x, train_y, val_x, val_y = [], [], [], []
         for pair, f, x, y, turnover in selected:
             cut = int(len(x)*0.80)
-            # purge 3 bars so a training label cannot look into validation period
-            if cut <= 100 or len(x)-cut < 35:
+            # Purge the full 6-bar label horizon to prevent train/validation leakage.
+            if cut <= 250 or len(x)-cut < 100:
                 continue
-            train_x.append(x.iloc[:cut-3])
-            train_y.append(y.iloc[:cut-3])
+            train_x.append(x.iloc[:cut-6])
+            train_y.append(y.iloc[:cut-6])
             val_x.append(x.iloc[cut:])
             val_y.append(y.iloc[cut:])
         if not train_x or not val_x:
@@ -560,7 +562,7 @@ class MLEngine:
             state["training_stats"] = store.training_stats()
             log.warning("Walk-forward training skipped: missing label classes")
             return
-        probe = HistGradientBoostingClassifier(max_iter=120, learning_rate=0.05, max_leaf_nodes=15, l2_regularization=1.5, random_state=42)
+        probe = HistGradientBoostingClassifier(max_iter=220, learning_rate=0.035, max_leaf_nodes=15, l2_regularization=2.0, min_samples_leaf=25, random_state=42)
         try:
             probe.fit(Xtr, Ytr)
             score = float(balanced_accuracy_score(Yv, probe.predict(Xv)))
@@ -644,8 +646,8 @@ class MLEngine:
                 close=("close", "last"), volume=("volume", "sum"))
         t1, t4 = self.trend(h1), self.trend(h4)
         threshold, n, winrate = store.threshold(symbol, cfg)
-        sl_dist = max(1.5*atr, price*0.0025)
-        tp_dist = max(2.3*atr, price*0.0035)
+        sl_dist = 1.6 * atr
+        tp_dist = 2.6 * atr
         action, conf = "HOLD", max(ps, ph, pl)
         if pl >= threshold and pl > ps and t1 == 1 and t4 >= 0:
             action, conf = "BUY", pl
