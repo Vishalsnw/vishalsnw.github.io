@@ -47,9 +47,9 @@ WEIGHT_STRENGTHS = [0.0, 0.5, 1.0]
 # Three non-overlapping chronological test windows; train expands each fold.
 # Fractions are based on globally sorted candle timestamps.
 FOLDS = [
-    (0.00, 0.50, 0.50, 0.65),
-    (0.00, 0.65, 0.65, 0.80),
-    (0.00, 0.80, 0.80, 0.95),
+    (0.50, 0.50, 0.65),
+    (0.65, 0.65, 0.80),
+    (0.80, 0.80, 0.95),
 ]
 ROUND_TRIP_COST_PCT = 0.12  # Assumption only; replace with verified all-in cost.
 MIN_TRAIN_ROWS = 300
@@ -291,7 +291,7 @@ def main():
         print("All-label distribution:",
               " | ".join(f"{name}={int(counts[label])} ({100*counts[label]/total:.1f}%)"
                          for label, name in zip(LABELS, LABEL_NAMES)))
-        for fold_no, (train_end, test_start, _, test_end) in enumerate(FOLDS, 1):
+        for fold_no, (train_end, test_start, test_end) in enumerate(FOLDS, 1):
             masks = fold_masks(panel, train_end, test_start, test_end)
             if masks is None:
                 print(f"Fold {fold_no}: no timestamp window")
